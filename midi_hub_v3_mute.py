@@ -3,7 +3,19 @@ import time
 import os
 import threading
 
-def play_midi_file(outport, stop_event, shared_data):
+# Define mute control numbers for specific MIDI notes
+mute_controls = {
+    35: 19,
+    36: 19,
+    38: 20,  # Assuming MIDI note 38 (typically a snare drum) has mute control number 20
+    38: 20
+    # Add other MIDI notes and their mute control numbers as needed
+}
+
+# Initialize the mute states (False means not muted)
+mute_states = {note: False for note in mute_controls}
+
+def play_midi_file(outport, stop_event, shared_data, mute_states):
     global midi_file_path
     while not stop_event.is_set():
         midi_file = mido.MidiFile(midi_file_path)
@@ -17,8 +29,8 @@ def play_midi_file(outport, stop_event, shared_data):
                 midi_file = mido.MidiFile(midi_file_path)
                 shared_data["queued_midi_file_path"] = None
 
-        tempo = int(60_000_000 / bpm)  # Convert BPM to microseconds per beat
-        ticks_per_step = ticks_per_beat / 4  # Assuming each step is a sixteenth note
+        tempo = int(60_000_000 / bpm)
+        ticks_per_step = ticks_per_beat / 4
         total_ticks_per_step = ticks_per_step * steps_per_bar
         elapsed_ticks = 0
 
@@ -26,14 +38,16 @@ def play_midi_file(outport, stop_event, shared_data):
             for msg in track:
                 if stop_event.is_set():
                     break
+
+                if msg.type == 'note_on' and msg.velocity > 0:
+                    if mute_states.get(msg.note, False):
+                        continue  # Skip muted notes
+
                 if not msg.is_meta:
-                    # Set the message to channel 0 (MIDI channel 1)
-                    if hasattr(msg, 'channel'):
-                        msg = msg.copy(channel=0)
                     elapsed_ticks += msg.time
                     if elapsed_ticks >= total_ticks_per_step:
                         elapsed_ticks -= total_ticks_per_step
-                        break  # Restart the pattern from the next step
+                        break
 
                     seconds_per_tick = tempo / (ticks_per_beat * 1000000.0)
                     time.sleep(msg.time * seconds_per_tick)
@@ -41,26 +55,31 @@ def play_midi_file(outport, stop_event, shared_data):
                 elif msg.type == 'set_tempo':
                     pass
 
-def listen_midi_input(inport, shared_data):
-    min_bpm = 40   # Define minimum BPM
-    max_bpm = 240  # Define maximum BPM
-    min_steps = 1   # Define minimum steps per bar
-    max_steps = 64  # Define maximum steps per bar
+def listen_midi_input(inport, shared_data, mute_states):
+    min_bpm = 40
+    max_bpm = 240
+    min_steps = 1
+    max_steps = 64
     for msg in inport:
         if msg.type == 'control_change':
             with shared_data["lock"]:
-                if msg.control == 10:  # Control Change for pattern selection
+                if msg.control == 10:
                     file_index = msg.value % len(midi_files)
                     shared_data["queued_midi_file_path"] = os.path.join('loops', midi_files[file_index])
-                elif msg.control == 11:  # Control Change for BPM
-                    bpm_value = msg.value / 127.0  # Normalize to range 0-1
+                elif msg.control == 11:
+                    bpm_value = msg.value / 127.0
                     shared_data["bpm"] = int(bpm_value * (max_bpm - min_bpm) + min_bpm)
-                elif msg.control == 12:  # Control Change for steps_per_bar
-                    steps_per_bar_value = msg.value / 127.0  # Normalize to range 0-1
+                elif msg.control == 12:
+                    steps_per_bar_value = msg.value / 127.0
                     shared_data["steps_per_bar"] = int(steps_per_bar_value * (max_steps - min_steps) + min_steps)
 
+            # Update mute states
+            for note, control in mute_controls.items():
+                if msg.control == control:
+                    mute_states[note] = msg.value > 63
+
 # Setup MIDI input and output
-inport = mido.open_input('LoopBe Internal MIDI 0')  # Change this to your MIDI input port
+inport = mido.open_input('LoopBe Internal MIDI 0')
 outport = mido.open_output('LoopBe Internal MIDI 1')
 
 # List MIDI files in directory
@@ -76,16 +95,16 @@ shared_data = {
 
 # Global variables
 stop_event = threading.Event()
-midi_file_path = os.path.join('loops', midi_files[0])  # Default to the first file
+midi_file_path = os.path.join('loops', midi_files[0])
 
 # Start the playback and MIDI input listening threads
-playback_thread = threading.Thread(target=play_midi_file, args=(outport, stop_event, shared_data))
+playback_thread = threading.Thread(target=play_midi_file, args=(outport, stop_event, shared_data, mute_states))
 playback_thread.start()
 
-midi_input_thread = threading.Thread(target=listen_midi_input, args=(inport, shared_data), daemon=True)
+midi_input_thread = threading.Thread(target=listen_midi_input, args=(inport, shared_data, mute_states), daemon=True)
 midi_input_thread.start()
 
-# Main loop for user input (for quitting the script)
+# Main loop
 while True:
     if input("Enter 'q' to quit: ").lower() == 'q':
         stop_event.set()
